@@ -1,0 +1,59 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - infrastructure
+
+stages:
+  - template: templates/tofu.yml
+    parameters:
+      planEnvironment: "Tofu Dev Plan"
+      applyEnvironment: "Tofu Dev Apply"
+      agentPool:
+        vmImage: "ubuntu-latest"
+      stageName: "ltsndlpocDev"
+      stageDisplayName: "Dev - Sndl Poc Web"
+      azureServicePrincipal: "ltsndlpoc-sp-azuredevops-dev-01"
+      azureTenantId: "fa2e957d-d348-4cf8-94cf-dae799dfbbda"
+      azureSubscriptionId: "216785a4-80e2-4d7a-9a79-e902057f546b"
+      tofuStorageResourceGroup: "lantern-sandbox-sndl-poc"
+      tofuStorageAccount: "ltsndlpocsttfcncdev01"
+      tofuStorageContainer: "tofu-ltsndlpoc-dev"
+      tofuStorageStateKey: "ltsndlpoc-dev.tfstate"
+      tofuWorkingDirectory: "infrastructure/opentofu/dev"
+
+  # - template: templates/tofu.yml
+  #   parameters:
+  #     planEnvironment: "Tofu QA Plan"
+  #     applyEnvironment: "Tofu QA Apply"
+  #     agentPool:
+  #       vmImage: "ubuntu-latest"
+  #     stageName: "ltdeftwebQA"
+  #     stageDisplayName: "QA - Deft Web"
+  #     azureServicePrincipal: "ltdeftweb-sp-azuredevops-qa-01"
+  #     azureTenantId: "fa2e957d-d348-4cf8-94cf-dae799dfbbda"
+  #     azureSubscriptionId: "216785a4-80e2-4d7a-9a79-e902057f546b"
+  #     tofuStorageResourceGroup: "ltdeftweb-rg-cnc-qa-01"
+  #     tofuStorageAccount: "ltdeftwebsttfcncqa01"
+  #     tofuStorageContainer: "tofu-ltdeftweb-qa"
+  #     tofuStorageStateKey: "ltdeftweb-qa.tfstate"
+  #     tofuWorkingDirectory: "infrastructure/tofu/example-qa"
+  #
+  # - template: templates/tofu.yml
+  #   parameters:
+  #     planEnvironment: "Tofu Prod Plan"
+  #     applyEnvironment: "Tofu Prod Apply"
+  #     agentPool:
+  #       vmImage: "ubuntu-latest"
+  #     stageName: "ltsndlpocProd"
+  #     stageDisplayName: "Prod - Sndl Poc Web"
+  #     azureServicePrincipal: "ltsndlpoc-sp-azuredevops-dev-01"
+  #     azureTenantId: "fa2e957d-d348-4cf8-94cf-dae799dfbbda"
+  #     azureSubscriptionId: "216785a4-80e2-4d7a-9a79-e902057f546b"
+  #     tofuStorageResourceGroup: "lantern-sandbox-sndl-poc"
+  #     tofuStorageAccount: "ltsndlpocsttfcncprod01"
+  #     tofuStorageContainer: "tofu-ltsndlpoc-prod"
+  #     tofuStorageStateKey: "ltsndlpoc-prod.tfstate"
+  #     tofuWorkingDirectory: "infrastructure/opentofu/example-prod"

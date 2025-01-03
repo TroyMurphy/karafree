@@ -1,0 +1,407 @@
+# Tofu pipeline with two stages that mimic the typical plan and apply steps.
+#
+# Azure DevOps environments are used to pause the flow to allow the operator to view tofu's plan (task called "Tofu Plan")
+# and to choose whether or not to apply the plan. Always review your plan!
+#
+# Remember to set up your environments in Azure DevOps which are used by this pipeline before running it. Always add approvals to
+# both the plan and apply stages!
+#
+# To ensure that the Tofu pipeline is used consistently and predictably:
+#
+# 1. Tofu's lock file, .tofu.lock.hcl, must exist and be up to date to use the same modules in both the plan and apply steps.
+#    * If you don't have this file, tofu will create it and the pipeline will display it for you to commit the new file in git.
+#    * If the files are different, the pipeline will display the differences for you to commit the changes in git.
+#
+# 2. We're storing tofu's plan file in the same storage account where the state file is stored.
+#    * Tofu's plan file contains secrets and never should be uploaded as a build pipeline artifact.
+#
+# 3. Environment variables are used to keep secrets out of the state files.
+#
+# 4. You can only apply a plan which was created in the same pipeline run (locking via version.txt).
+#
+# 5. Your provider.tf file should lock azurerm down to a specific version.
+#
+# Unfortunately we have to initialize tofu twice, once in each step. For some reason, cloud linux build agents seem to perform
+# initialization significantly faster than cloud windows build agents.
+#
+# This pipeline is in one file on purpose. While using templates for the repeated steps (tofu init) would be "cleaner", you
+# lose context in what this pipeline is trying to do. Plus, this pipeline will most likely be used in multiple projects and
+# you currently only have to keep track of a single file.
+
+parameters:
+  - name: agentPool
+    displayName: "Agent pool where tofu runs, set this the same as the pool object: https://learn.microsoft.com/en-us/azure/devops/pipelines/yaml-schema/pool?view=azure-pipelines#pool-name-demands-vmimage"
+    type: object
+  - name: planEnvironment
+    displayName: "Name of the Azure DevOps environment used in tofu's plan step, ensure that there is a gate on this environment as tofu doesn't need to automatically run all the time"
+    type: string
+  - name: applyEnvironment
+    displayName: "Name of the Azure DevOps environment used in tofu's apply step, ensure that there is a gate on this environment otherwise tofu will perform changes outlined in the plan without warning (including deleting all your resources)"
+    type: string
+  - name: stageName
+    displayName: "Internal name of the stage, used to differentiate runs in different environments such as DEV/QA..."
+    type: string
+  - name: stageDisplayName
+    displayName: "Friendly name for the stage"
+    type: string
+  # Azure
+  - name: azureServicePrincipal
+    displayName: "Name of the service principal (service connection) which tofu will run under"
+    type: string
+  - name: azureTenantId
+    displayName: "You can find your tenant Id in Azure by searching for 'tenant properties'"
+    type: string
+  - name: azureSubscriptionId
+    displayName: "You can find your subscriptions Id by looking in the Azure resource group overview page"
+    type: string
+  # Tofu
+  - name: tofuStorageResourceGroup
+    displayName: "This is the name of resource group where tofu's state file is stored, it must already exist"
+    type: string
+  - name: tofuStorageAccount
+    displayName: "This is the name of the storage account tofu's state file is stored, it must already exist"
+    type: string
+  - name: tofuStorageContainer
+    displayName: "Name of the storage account container in the non-enforced format: projectname-environment"
+    type: string
+  - name: tofuStorageStateKey
+    displayName: "Name of tofu's state file: projectname-environment.tfstate"
+    type: string
+  - name: tofuWorkingDirectory
+    displayName: "This is the directory, in this repository, where tofu will operate from"
+    type: string
+
+stages:
+  # Tofu's plan step
+  - stage: "${{ parameters.stageName }}Plan"
+    displayName: "${{ parameters.stageDisplayName }} Plan"
+    variables:
+      # Name of tofu's lock file which is maintained by tofu and not something you'll need to change
+      # see: https://developer.hashicorp.com/tofu/language/files/dependency-lock
+      lockFile: ".terraform.lock.hcl"
+      # Name of tofu's plan file when it has been compressed
+      planArchive: "plan.tar.bz2"
+    dependsOn: []
+    jobs:
+      - deployment: "plan${{ parameters.stageName }}"
+        displayName: "Plan"
+        environment: "${{ parameters.planEnvironment }}"
+        pool: ${{ parameters.agentPool }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+                - checkout: self
+
+                # - task: TofuInstaller@1
+                #   displayName: "Install Tofu"
+                #   inputs:
+                #     tofuVersion: latest # The tofu program is stable enough to always use the latest version
+                - task: Bash@3
+                  inputs:
+                    targetType: "inline"
+                    script: |
+                      echo "Installing OpenTofu"
+                      curl --proto '=https' --tlsv1.2 -fsSL https://get.opentofu.org/install-opentofu.sh -o install-opentofu.sh
+                      chmod +x install-opentofu.sh
+                      ./install-opentofu.sh --install-method deb
+                      rm -f install-opentofu.sh
+                  displayName: "Install OpenTofu"
+
+                - task: AzureCLI@2
+                  displayName: "Tofu Init"
+                  inputs:
+                    azureSubscription: "${{ parameters.azureServicePrincipal }}"
+                    workingDirectory: "${{ parameters.tofuWorkingDirectory }}"
+                    # We need the pipeline's credentials for tofu to run under them.
+                    addSpnToEnvironment: true
+                    # We're handling errors ourselves in this task, otherwise the task bails on stderr and we want to display a helpful error message.
+                    powerShellErrorActionPreference: "continue"
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      # Tofu's state storage account must exist and if it doesn't, a confusing error message is displayed and tofu will
+                      # seem to hang forever.
+                      az storage account show --subscription "${{ parameters.azureSubscriptionId }}" `
+                                              --resource-group "${{ parameters.tofuStorageResourceGroup }}" `
+                                              --name "${{ parameters.tofuStorageAccount }}" `
+                                              --output none
+
+                      if ($? -eq $false) {
+                        Write-Output ""
+                        Write-Output "Storage account ${{ parameters.tofuStorageAccount }} does not exist"
+                        Exit 1
+                      }
+
+                      # Create the storage account container if it doesn't exist as tofu won't create this itself and will fail.
+                      az storage container create --auth-mode login `
+                                                  --account-name "${{ parameters.tofuStorageAccount }}" `
+                                                  --name "${{ parameters.tofuStorageContainer }}" `
+                                                  --public-access off `
+                                                  --output none
+
+                      if ($? -eq $false) {
+                        Write-Output ""
+                        Write-Output "Failed to create container ${{ parameters.tofuStorageContainer }} in storage account ${{ parameters.tofuStorageAccount }}"
+                        Exit 1
+                      }
+
+                      # Using environment variables during init prevents ARM_CLIENT_SECRET being saved into a file.
+                      $env:ARM_TENANT_ID = "${{ parameters.azureTenantId }}"
+                      $env:ARM_SUBSCRIPTION_ID = "${{ parameters.azureSubscriptionId }}"
+                      $env:ARM_CLIENT_ID = "$env:servicePrincipalId" # Added by the task input addSpnToEnvironment
+                      $env:ARM_CLIENT_SECRET = "$env:servicePrincipalKey" # Added by the task input addSpnToEnvironment
+                      $env:TF_IN_AUTOMATION = "true" # Suppress message which are helpful to humans and not to robots in pipelines
+
+                      # Initialize our backend
+                      tofu init `
+                        -backend-config="resource_group_name=${{ parameters.tofuStorageResourceGroup }}" `
+                        -backend-config="storage_account_name=${{ parameters.tofuStorageAccount }}" `
+                        -backend-config="container_name=${{ parameters.tofuStorageContainer }}" `
+                        -backend-config="key=${{ parameters.tofuStorageStateKey }}" `
+                        -input=false # If something is missing, tofu won't ask for it as you won't be able to answer in a pipeline
+
+                      if ($? -eq $false) {
+                        Exit 1
+                      }
+
+                      # Tofu maintains its lock file and this file should always exist. This is one of those checks that you won't need
+                      # until someone has removed it.
+                      if (!(Test-Path "$(lockFile)")) {
+                        Write-Output ""
+                        Write-Output "File ${{ parameters.tofuWorkingDirectory }}/$(lockFile) does not exist"
+                        Exit 1
+                      }
+
+                      # Ask if tofu's lock file exists in git.
+                      git ls-files --error-unmatch -- "$(lockFile)" *>&1 | Out-Null
+
+                      if ($? -eq $false) {
+                        Write-Output ""
+                        Write-Output "File ${{ parameters.tofuWorkingDirectory }}/$(lockFile): is new and must be committed into git:"
+                        Write-Output "---8<-------------------------------------------------------------------------"
+                        Get-Content "$(lockFile)"
+                        Write-Output "--->8-------------------------------------------------------------------------"
+                        Exit 1
+                      }
+
+                      # See if tofu's lock file has been modified during initialization.
+                      git diff --exit-code -- "$(lockFile)" *>&1 | Out-Null
+
+                      if ($? -eq $false) {
+                        Write-Output ""
+                        Write-Output "File ${{ parameters.tofuWorkingDirectory }}/$(lockFile) has changed and the file in git must be updated:"
+                        Write-Output "---8<-------------------------------------------------------------------------"
+                        git diff --patch "$(lockFile)"
+                        Write-Output "--->8-------------------------------------------------------------------------"
+                        Exit 1
+                      }
+
+                - task: AzureCLI@2
+                  name: "tofuPlan"
+                  displayName: "Tofu Plan"
+                  inputs:
+                    azureSubscription: "${{ parameters.azureServicePrincipal }}"
+                    workingDirectory: "${{ parameters.tofuWorkingDirectory }}"
+                    addSpnToEnvironment: true
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      $env:ARM_TENANT_ID = "${{ parameters.azureTenantId }}"
+                      $env:ARM_SUBSCRIPTION_ID = "${{ parameters.azureSubscriptionId }}"
+                      $env:ARM_CLIENT_ID = "$env:servicePrincipalId"
+                      $env:ARM_CLIENT_SECRET = "$env:servicePrincipalKey"
+                      $env:TF_IN_AUTOMATION = "true"
+                      $planDir = "$env:BUILD_ARTIFACTSTAGINGDIRECTORY/plan"
+
+                      # Tofu won't create this directory if it doesn't exist
+                      New-Item -ItemType Directory -Path $planDir | Out-Null
+
+                      # Provide a plan and give a detailed response on what happened via the exit code
+                      # https://developer.hashicorp.com/tofu/cli/commands/plan#detailed-exitcode
+                      tofu plan -out="$planDir/${{ parameters.stageName }}.plan" `
+                                     -detailed-exitcode `
+                                     -input=false
+
+                       Switch ($global:LASTEXITCODE) {
+                         0 {
+                           Write-Verbose "Tofu has no changes"
+                         }
+                         2 {
+                           # Uniquely identify this pipeline run so we can verify that this plan belongs to the same pipeline run in the apply step
+                           $planVersion = "stage=${{ parameters.stageName }},build=${env:BUILD_BUILDNUMBER},hash=$(git log -n 1 --pretty=format:'%H')"
+
+                           # Create an Azure DevOps variable to signal that there's changes to perform
+                           Write-Host "##vso[task.setvariable variable=tofuHasChanges;isOutput=true]true"
+                           Write-Output "Version: ${planVersion}"
+
+                           Set-Content -Path "$planDir/version.txt" -Value $planVersion
+                         }
+                         Default { # Any exit code, including 1, is handled as an error because we weren't expecting it
+                           Exit 1
+                         }
+                       }
+
+                - task: ArchiveFiles@2
+                  displayName: "Archive Plan"
+                  condition: and(succeeded(), eq(variables['tofuPlan.tofuHasChanges'], 'true'))
+                  inputs:
+                    rootFolderOrFile: "$(Build.ArtifactStagingDirectory)/plan"
+                    includeRootFolder: true
+                    archiveType: "tar"
+                    tarCompression: "bz2"
+                    archiveFile: "$(Build.ArtifactStagingDirectory)/$(planArchive)"
+                    replaceExistingArchive: false
+                    verbose: true
+
+                - task: AzureCLI@2
+                  displayName: "Upload Plan"
+                  condition: and(succeeded(), eq(variables['tofuPlan.tofuHasChanges'], 'true'))
+                  inputs:
+                    azureSubscription: "${{ parameters.azureServicePrincipal }}"
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    workingDirectory: "$(Build.ArtifactStagingDirectory)"
+                    inlineScript: |
+                      az storage blob upload --auth-mode login `
+                                             --file "$(planArchive)" `
+                                             --account-name "${{ parameters.tofuStorageAccount }}" `
+                                             --container-name "${{ parameters.tofuStorageContainer }}" `
+                                             --name "$(planArchive)" `
+                                             --overwrite `
+                                             --no-progress `
+                                             --output none
+
+  # Tofu's apply step
+  - stage: "${{ parameters.stageName }}Apply"
+    displayName: "${{ parameters.stageDisplayName }} Apply"
+    dependsOn: "${{ parameters.stageName }}Plan"
+    variables:
+      # This variable isn't used in this step, it's here in case you do need it as referencing variables in other stages isn't exactly obvious.
+      tofuHasChanges: $[stageDependencies.${{ parameters.stageName }}Plan.plan${{ parameters.stageName }}.outputs['plan${{ parameters.stageName }}.tofuPlan.tofuHasChanges']]
+      # Must be same as the plan step variable
+      planArchive: "plan.tar.bz2"
+    condition: and(succeeded(), eq(dependencies.${{ parameters.stageName }}Plan.outputs['plan${{ parameters.stageName }}.plan${{ parameters.stageName }}.tofuPlan.tofuHasChanges'], 'true'))
+    jobs:
+      - deployment: "apply${{ parameters.stageName }}"
+        displayName: "Apply"
+        environment: "${{ parameters.applyEnvironment }}"
+        pool: ${{ parameters.agentPool }}
+        # Some operations take a very long time (looking at your hour long creations, app service environments).
+        # If tofu is killed in the middle of something, you might have to manually maneuver tofu back into position. Which can be VERY difficult.
+        # Always try and let tofu gracefully exit.
+        timeoutInMinutes: 0
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+                - checkout: self
+                # - task: TofuInstaller@1
+                #   displayName: "Install Tofu"
+                #   inputs:
+                #     tofuVersion: latest
+                - task: Bash@3
+                  inputs:
+                    targetType: "inline"
+                    script: |
+                      echo "Installing OpenTofu"
+                      curl --proto '=https' --tlsv1.2 -fsSL https://get.opentofu.org/install-opentofu.sh -o install-opentofu.sh
+                      chmod +x install-opentofu.sh
+                      ./install-opentofu.sh --install-method deb
+                      rm -f install-opentofu.sh
+                  displayName: "Install OpenTofu"
+
+                # Essentially the same as the plan stage's init task without the extra error checking as that's been done already.
+                # Doesn't guard against something happening behind this pipeline's back.
+                - task: AzureCLI@2
+                  displayName: "Tofu Init"
+                  inputs:
+                    azureSubscription: "${{ parameters.azureServicePrincipal }}"
+                    workingDirectory: "${{ parameters.tofuWorkingDirectory }}"
+                    addSpnToEnvironment: true
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      $env:ARM_TENANT_ID = "${{ parameters.azureTenantId }}"
+                      $env:ARM_SUBSCRIPTION_ID = "${{ parameters.azureSubscriptionId }}"
+                      $env:ARM_CLIENT_ID = "$env:servicePrincipalId"
+                      $env:ARM_CLIENT_SECRET = "$env:servicePrincipalKey"
+                      $env:TF_IN_AUTOMATION = "true"
+
+                      tofu init `
+                        -backend-config="resource_group_name=${{ parameters.tofuStorageResourceGroup }}" `
+                        -backend-config="storage_account_name=${{ parameters.tofuStorageAccount }}" `
+                        -backend-config="container_name=${{ parameters.tofuStorageContainer }}" `
+                        -backend-config="key=${{ parameters.tofuStorageStateKey }}" `
+                        -input=false
+
+                - task: AzureCLI@2
+                  displayName: "Download Plan"
+                  inputs:
+                    azureSubscription: "${{ parameters.azureServicePrincipal }}"
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    workingDirectory: "$(Build.ArtifactStagingDirectory)"
+                    inlineScript: |
+                      az storage blob download --auth-mode login `
+                                               --file "$(planArchive)" `
+                                               --account-name "${{ parameters.tofuStorageAccount }}" `
+                                               --container-name "${{ parameters.tofuStorageContainer }}" `
+                                               --name "$(planArchive)" `
+                                               --no-progress `
+                                               --output none
+
+                - task: ExtractFiles@1
+                  displayName: "Extract Plan"
+                  inputs:
+                    archiveFilePatterns: "$(Build.ArtifactStagingDirectory)/$(planArchive)"
+                    destinationFolder: "$(Build.ArtifactStagingDirectory)"
+                    cleanDestinationFolder: false
+
+                - task: Bash@3
+                  displayName: "Verify Plan"
+                  inputs:
+                    targetType: "inline"
+                    script: |
+                      # Version from the plan archive.
+                      planVersion=$(cat "$BUILD_ARTIFACTSTAGINGDIRECTORY/plan/version.txt" | tr -d '\r')
+                      # Generate the version using the same algorithm in the plan stage.
+                      gitHash=$(git log -n 1 --pretty=format:'%H')
+                      thisVersion="stage=${{ parameters.stageName }},build=${BUILD_BUILDNUMBER},hash=$gitHash"
+
+                      echo ""
+                      echo "Version from plan archive: $planVersion"
+                      echo "Current plan version: $thisVersion"
+
+                      # Prevent humans from generating a plan in one pipeline run and approving the apply step in a completely different pipeline run.
+                      if [ "$planVersion" != "$thisVersion" ]; then
+                        echo ""
+                        echo "This plan cannot be applied as the plan file has been created by a different pipeline run."
+                        echo "Try reviewing the plan from the latest plan step then applying it from there."
+                        exit 1
+                      fi
+
+                - task: AzureCLI@2
+                  displayName: "Tofu Apply"
+                  inputs:
+                    azureSubscription: "${{ parameters.azureServicePrincipal }}"
+                    workingDirectory: "${{ parameters.tofuWorkingDirectory }}"
+                    addSpnToEnvironment: true
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      $env:ARM_TENANT_ID = "${{ parameters.azureTenantId }}"
+                      $env:ARM_SUBSCRIPTION_ID = "${{ parameters.azureSubscriptionId }}"
+                      $env:ARM_CLIENT_ID = "$env:servicePrincipalId"
+                      $env:ARM_CLIENT_SECRET = "$env:servicePrincipalKey"
+                      $env:TF_IN_AUTOMATION = "true"
+                      $planDir = "$env:BUILD_ARTIFACTSTAGINGDIRECTORY/plan"
+
+                      # A human has reviewed the plan output in the tofu plan task and approved the Azure DevOps environment.
+                      # We're ready to automatically apply those changes.
+
+                      tofu apply -auto-approve `
+                                      -input=false `
+                                      "$planDir/${{ parameters.stageName }}.plan"

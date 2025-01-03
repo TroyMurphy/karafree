@@ -1,0 +1,121 @@
+name: $(Year:yyyy).$(Month).$(DayOfMonth).$(Rev:r)
+
+trigger:
+  branches:
+    include:
+      - main
+  # paths:
+  #   include:
+  #     - klaviyo-mock/server
+
+variables:
+  - group: SNDL-dev
+  - name: buildConfiguration
+    value: "release"
+  - name: net-sdk-version
+    value: "8.0.x"
+  - name: linuxImageName
+    value: "ubuntu-latest"
+  - name: isRelease
+    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/release')]
+stages:
+  - stage: Build
+    displayName: "Build"
+    pool:
+      vmImage: $(linuxImageName)
+    jobs:
+      - job: build_api
+        steps:
+          - checkout: self
+            clean: true
+          - task: UseDotNet@2
+            displayName: Use .NET Core sdk $(net-sdk-version)
+            inputs:
+              version: $(net-sdk-version)
+          - task: NuGetAuthenticate@1
+            displayName: NuGet Authenticate with Azure Devops
+            inputs:
+              forceReinstallCredentialProvider: true
+          - task: DotNetCoreCLI@2
+            displayName: Build API
+            inputs:
+              command: "build"
+              publishWebProjects: false
+              projects: "klaviyo-mock/server/server.csproj"
+
+  - stage: Publish
+    displayName: "Publish"
+    dependsOn: Build
+    condition: succeeded()
+    pool:
+      vmImage: $(linuxImageName)
+    jobs:
+      - job: publish_api
+        steps:
+          - checkout: self
+            clean: true
+          # - template: task-extract-assembly-version.yml@templates
+          - task: UseDotNet@2
+            displayName: Use .NET Core sdk $(net-sdk-version)
+            inputs:
+              version: $(net-sdk-version)
+          - task: NuGetAuthenticate@1
+            displayName: NuGet Authenticate with Azure Devops
+            inputs:
+              forceReinstallCredentialProvider: true
+          - task: DotNetCoreCLI@2
+            inputs:
+              command: "publish"
+              publishWebProjects: false
+              projects: "klaviyo-mock/server/server.csproj"
+              arguments: "--configuration $(buildConfiguration) --output
+                $(Build.ArtifactStagingDirectory)"
+              zipAfterPublish: true
+          # publish as an artifact so its available for deployment
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+              ArtifactName: klaviyo-mock-server
+              publishLocation: "Container"
+
+  - stage: Deploy_DEV_Web_Api
+    displayName: "Deploy to Api and Web to DEV"
+    dependsOn: Publish
+    condition: and(succeeded(), not(in(variables['Build.SourceBranch'], 'refs/heads/release')))
+    variables:
+      - group: SNDL-dev
+    jobs:
+      - deployment: Deploy_DEV
+        environment: dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Get Artifact
+                # - download: current
+                #   artifact: sndl-web-dev
+                #
+                # # Deploy to app service
+                # - task: AzureRmWebAppDeployment@4
+                #   displayName: "deploy to ClientApp app service"
+                #   inputs:
+                #     ConnectionType: "AzureRM"
+                #     azureSubscription: cudgc-dev-service-connection
+                #     resourceGroupName: CUDGC-Dev-Work
+                #     appType: "webAppLinux"
+                #     WebAppName: app-clientapp-cubi-dev
+                #     package: $(Pipeline.Workspace)/cubi-web-dev/cubi-web-dev.zip
+                #
+                - download: current
+                  artifact: klaviyo-mock-server
+
+                # Deploy to app service
+                - task: AzureRmWebAppDeployment@4
+                  displayName: "deploy api to app service"
+                  inputs:
+                    ConnectionType: "AzureRM"
+                    azureSubscription: ltsndlpoc-sp-azuredevops-dev-01
+                    resourceGroupName: $(Azure.ResourceGroupName)
+                    appType: "webAppLinux"
+                    WebAppName: "ltsndl-app-webai-cnc-dev-01"
+                    package: $(Pipeline.Workspace)/klaviyo-mock-server/server.zip
