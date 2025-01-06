@@ -1,5 +1,4 @@
 # Here's where your terraform code goes.
-# This example is incomplete and won't work immediately.
 
 resource "azurerm_service_plan" "sp" {
   name                = "sndl-poc-sp"
