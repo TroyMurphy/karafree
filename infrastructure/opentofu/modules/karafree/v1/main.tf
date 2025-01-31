@@ -1,7 +1,5 @@
-# Here's where your terraform code goes.
-
 resource "azurerm_service_plan" "sp" {
-  name                = "sndl-poc-sp"
+  name                = var.service_plan_name
   resource_group_name = var.resource_group_name
   location            = var.location
   os_type             = "Linux"
@@ -17,7 +15,7 @@ resource "azurerm_application_insights" "ai" {
 }
 
 resource "azurerm_web_pubsub" "wps" {
-  name                = "tfex-webpubsub"
+  name                = var.web_pubsub_name
   location            = azurerm_resource_group.example.location
   resource_group_name = azurerm_resource_group.example.name
 
@@ -37,6 +35,36 @@ resource "azurerm_web_pubsub" "wps" {
   }
 }
 
+resource "azurerm_key_vault" "kv" {
+  name                = var.keyvault_name
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  tenant_id           = var.tenant_id
+  sku_name            = "standard"
+
+  soft_delete_retention_days = 7
+
+  access_policy {
+    tenant_id = var.tenant_id
+    object_id = azurerm_linux_web_app.web.identity[0].principal_id
+
+    key_permissions = [
+      "Get",
+      "List"
+    ]
+    secret_permissions = [
+      "Get",
+      "List"
+    ]
+  }
+}
+
+resource "azurerm_key_vault_secret" "wps_connection_string" {
+  name         = "WebPubSubConnectionString"
+  value        = azurerm_web_pubsub.wps.primary_connection_string
+  key_vault_id = azurerm_key_vault.kv.id
+}
+
 resource "azurerm_linux_web_app" "web" {
   name                          = var.web_app_name
   location                      = var.location
@@ -46,10 +74,10 @@ resource "azurerm_linux_web_app" "web" {
   https_only                    = true
   tags                          = var.tags
 
-  # managed identity for secretless authentication
   identity {
     type = "SystemAssigned"
   }
+
   site_config {
     application_stack {
       dotnet_version = "8.0"
@@ -66,8 +94,6 @@ resource "azurerm_linux_web_app" "web" {
     ApplicationInsights__InstrumentationKey = azurerm_application_insights.ai.instrumentation_key
     APPLICATIONINSIGHTS_CONNECTION_STRING   = azurerm_application_insights.ai.connection_string
     TZ                                      = "America/Edmonton"
-    Websockets__ConnectionString            = azurerm_web_pubsub.wps.primary_connection_string
-    
+    Websockets__ConnectionString            = "@Microsoft.KeyVault(SecretUri=${azurerm_key_vault_secret.wps_connection_string.id})"
   }
 }
-

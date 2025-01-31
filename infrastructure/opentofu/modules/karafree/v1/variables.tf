@@ -18,6 +18,24 @@ variable "tags" {
   default = {}
 }
 
+variable "keyvault_name" {
+  description = "Name of the key vault resource"
+  type        = string
+  default     = "karafree-keyvault"
+}
+
+variable "service_plan_name" {
+  description = "Name of the web pub sub resource"
+  type        = string
+  default     = "karafree-sp"
+}
+
+variable "web_pubsub_name" {
+  description = "Name of the web pub sub resource"
+  type        = string
+  default     = "webpubsub"
+}
+
 variable "web_app_name" {
   description = "Name of the web app backend api resource"
   type        = string
